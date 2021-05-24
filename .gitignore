@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# VSCode
+.vscode/
+
+# Databases
+wh/
+*.db
+
+# thumbnail cache on Windows
+Thumbs.db
+
