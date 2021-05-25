@@ -11,3 +11,5 @@ wh/
 # thumbnail cache on Windows
 Thumbs.db
 
+# Notebooks
+*.ipynb
