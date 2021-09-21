@@ -1,5 +1,34 @@
-#from typing_extensions import ParamSpecArgs
-from warnings import WarningMessage
+""" 
+Warehouse is a folder with parquet files. Each parquet file holds pandas dataframe with DateTimeIndex and several columns (tags)
+It is assumed that all dataframes in warehouse have identical sample rate.
+The library is designed for working with databases containing hundreds or several thousands of tags (columns) and hundreds of thousands rows.
+
+When dataframe is written to the warehouse, it is divided into portions of 10 tags per file (this default value can be changed). 
+Tag<->file mapping can be manually overridden when calling write(), or warehouse can be fully rebuilt later.
+
+We cannot add or remove columns to file, so every write operation consists of:
+- read whole file from disk,
+- add data to file,
+- write whole dataframe to disk.
+This is why it's better to divide data to small portions
+
+Every folder has 'builtin' parquet file named vcb, which contains
+list of available tags, tag <-> file mapping, and (under question) other metadata (description, units, ...)
+
+Use case:
+import warehouse as wh
+# Connect to warehouse 
+store = wh.Store(wh_path)
+# List available tags:
+store.vcb 
+# Read from warehouse 
+df = store.read(taglist=['2101FIC201.PV', '2101FIC205.PV'],
+                begin='2021-03-25 00:00:00',
+                end='2021-03-28 00:00:00')
+# Write to warehouse
+store.write(df)
+"""
+
 import numpy as np
 import pandas as pd
 import os
@@ -11,88 +40,36 @@ import warnings
 import uuid
 import openpyxl
 import logging
+import sys
 
-# Warehouse is a folder with parquet files. Each parquet file holds dataframe with datetime index and several columns (tags)
-# Example: Folder with 3 warehouses: avg10m, snp1m, lab
-
-# When you add data to the store, they are written 10 tags per file by default. 
-# This can be reassigned manually when calling write_tags, or warehouse can be fully rebuilt later
-
-# We cannot add or remove columns to file, so we
-# delete and create file from scratch. This is why it's better
-# to divide data to small portions
-
-# Every folder has 'builtin' parquet file named vcb, which contains
-# list of available tags, tag <-> file mapping, and (under question) other metadata (description, units, ...)
-
-# The following is under question:
-# There are different types of files (or warehouses?):
-#   - column-wise (timestamp, tag1, tag2, ...)
-#   - row-wise (timestamp, tagname, value)
-
-# Use case:
-# import warehouse as wh
-# store = wh.create_store('some path')
-# store = wh.connect_store('some_path')
-
-# store.list_tags()
-# store.get_vcb()
-# store.get_info()
-
-# df = store.read(taglist=['2101FIC201.PV', '2101FIC205.PV'],
-#                 begin='2021-03-25 00:00:00',
-#                 end='2021-03-28 00:00:00')
-
-# store.write(df)
-# store.write(df, vcb)
-
-# store.rebuild(vcb)
-
-# store.update_from_excel('some_folder_path')
-
-# create logger with 'spam_application'
-logger = logging.getLogger('warehouse')
+# Setup logging
+logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-# create file handler which logs even debug messages
-fh = logging.FileHandler('warehouse.log')
+fh = logging.handlers.TimedRotatingFileHandler('warehouse.log', when='D', backupCount=5)
 fh.setLevel(logging.DEBUG)
-# create console handler with a higher log level
-#ch = logging.StreamHandler()
-#ch.setLevel(logging.WARNING)
-# create formatter and add it to the handlers
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 fh.setFormatter(formatter)
-#ch.setFormatter(formatter)
-# add the handlers to the logger
+if (logger.hasHandlers()):
+    logger.handlers.clear()
 logger.addHandler(fh)
-#logger.addHandler(ch)
 
 class Store:
     ''' Store object represents a folder which contains a number of parquet files'''
 
     def __init__(self, path: str = '//wh', tags_per_file=10):
         self.path = path
-        if tags_per_file < 1:
-            tags_per_file = 1
-            warnings.warn('tags_per_file set to 1.')
-        elif tags_per_file > 1000:
-            tags_per_file = 1000
-            warnings.warn('tags_per_file set to 1000.')
-
         self.tags_per_file = tags_per_file
 
-        p = Path(path).joinpath('vcb.parquet')
-        if p.is_file(): # file exists
-            self._vcb = pd.read_parquet(p)
-            print('Succesfully connected to existing store.')
-        else:
-            #TODO: check if other files already present in the folder?
-            self._vcb = pd.DataFrame({'Filename': [], 'Description': [], 'EngUnit': []}, 
-                    index=pd.Series([], name='TagName', dtype='object'))
-            self._vcb.to_parquet(p, index=True)
-            print('Created new store.')
+        p = Path(path)
+        if not p.is_dir():
+            raise ValueError(f'Cannot connect to {p}')
+        self._vcb = self.build_vcb()
+        print('Succesfully connected to store.')
 
-
+    @property
+    def vcb(self):
+        return self._vcb
+        
     @property
     def path(self):
         return self._path
@@ -104,78 +81,29 @@ class Store:
         else:
             raise ValueError(f"Path {value} doesn't exist or is not a folder")
 
-    def file_info(self, filename: str):
-        '''Get information on particular file: cols, rows, begin, end'''
+    @property
+    def tags_per_file(self):
+        return self._tags_per_file
 
-        try:
-            pf = ParquetFile(Path(self.path).joinpath(filename))
-            cols = len(pf.info['columns'])
-            rows = pf.info['rows']
-            try:
-                begin = str(pf.statistics['min']['Timestamp'][0])[:16]
-                end = str(pf.statistics['max']['Timestamp'][0])[:16]
-            except:
-                begin, end = '', ''
-        except:
-            cols, rows, begin, end = 'None', 'None', 'None', 'None'
+    @tags_per_file.setter
+    def tags_per_file(self, value: int):
+        if value < 1:
+            value = 1
+            warnings.warn('tags_per_file set to 1.')
+        elif value > 1000:
+            value = 1000
+            warnings.warn('tags_per_file set to 1000.')
+        self._tags_per_file = value    
 
-        return cols, rows, begin, end     
-            
-    def file_info(self):
-        '''Get list of files used in the store with short information.
-        Returns list of dicts with keys: filename, cols, rows, begin, end'''
-        files = [f for f in os.scandir(self._path) if f.is_file()]
-        info = []
-        for f in files:  
-            try:
-                pf = ParquetFile(f.path)
-                cols = len(pf.info['columns'])
-                rows = pf.info['rows']
-                try:
-                    begin = str(pf.statistics['min']['Timestamp'][0])[:16]
-                    end = str(pf.statistics['max']['Timestamp'][0])[:16]
-                except:
-                    begin, end = '', ''
-            except:
-                cols, rows, begin, end = 'None', 'None', 'None', 'None'
-            info.append({'filename': f.name, 'cols': cols, 'rows': rows, 'begin': begin, 'end': end})
-        return info
-
-    def list_files(self):
-        '''Get dataframe with short information about files used in the store.'''
-        files = [f for f in os.scandir(self._path) if f.is_file()]
-        info = []
-        for f in files:  
-            cols, rows, begin, end = self.file_info(f.name)
-            info.append({'filename': f.name, 'cols': cols, 'rows': rows, 'begin': begin, 'end': end})
-        return pd.DataFrame(self.file_info())
-
-    def dataframe_is_valid(self, dataframe: pd.DataFrame):
-        '''Check if dataframe can be written to the store'''
-        # must have datetime index
-        if not isinstance(dataframe.index, pd.DatetimeIndex):
-            print('Dataframe index is not instance of DateTimeIndex')
-            return False
-
-        # index must be unique
-        number_of_duplicates = dataframe.index.duplicated().sum()
-        if number_of_duplicates > 0:
-            print(f'Dataframe index has {number_of_duplicates} duplicates.')
-            return False
-
-        return True
-
-    def rebuild_vcb(self):
-        '''Rebuild vcb dataframe with tag <-> file mapping, which is
-        built from real files. '''
-
+    def build_vcb(self):
+        '''Rebuild vcb dataframe (tag <-> file mapping) '''
         files = [f for f in os.scandir(self._path) if f.is_file() and 
-                                                      f.name != 'vcb.parquet' and 
                                                       'metadata' not in f.name]
         tagname_list = []
         filename_list = []
-        description_list = []
-        engunit_list = []
+        rows_list = []
+        begin_list = []
+        end_list = []
 
         for f in files:
             try:
@@ -190,27 +118,52 @@ class Store:
             else:
                 warnings.warn(f'{f.name} doesnt contain Timestamp column')
                 continue
+            rows = pf.info['rows']
+            
+            try:
+                begin = str(pf.statistics['min']['Timestamp'][0])[:16]
+                end = str(pf.statistics['max']['Timestamp'][0])[:16]
+            except:
+                logging.error(f'Unexpected error in rebuild_vcb: {sys.exc_info()[0]}')
+                begin, end = '', ''
             
             for c in columns:
                 tagname_list.append(c)
                 filename_list.append(f.name)
-                try:
-                    description_list.append(self._vcb.loc[c, 'Description'])
-                except KeyError:
-                    description_list.append('')
-                try:
-                    engunit_list.append(self._vcb.loc[c, 'EngUnit'])
-                except KeyError:
-                    engunit_list.append('')
+                rows_list.append(rows)
+                begin_list.append(begin)
+                end_list.append(end)
 
-        self._vcb = pd.DataFrame({'Filename': filename_list, 
-                                   'Description': description_list,
-                                   'EngUnit': engunit_list}, 
-                                    index=pd.Series(tagname_list, name='TagName')).sort_index()
-        self._vcb.to_parquet(Path(self._path).joinpath('vcb.parquet'))
+        if tagname_list:
+            vcb = pd.DataFrame({'Filename': filename_list, 
+                                  'Rows': rows_list,
+                                  'Begin': begin_list,
+                                  'End': end_list}, 
+                                  index=pd.Series(tagname_list, name='TagName')).sort_index()
+        else:
+            vcb = pd.DataFrame({'Filename': [], 'Rows': [], 'Begin': [], 'End': []}, 
+                                     index=pd.Series([], name='TagName', dtype='object'))
+        return vcb
 
-        return self._vcb      
+    def rebuild_vcb():
+        self._vcb = build_vcb()
+        return self._vcb
     
+    def dataframe_is_valid(self, dataframe: pd.DataFrame):
+        '''Check if dataframe can be written to the store'''
+        # must have datetime index
+        if not isinstance(dataframe.index, pd.DatetimeIndex):
+            print('Dataframe index is not instance of DateTimeIndex')
+            return False
+
+        # index must be unique
+        number_of_duplicates = dataframe.index.duplicated().sum()
+        if number_of_duplicates > 0:
+            print(f'Dataframe index has {number_of_duplicates} duplicates.')
+            return False
+
+        return True
+        
     def check_time_range(exist_begin, exist_end, new_begin, new_end):
         #TODO:
         if isinstance(exist_begin, str):
@@ -228,19 +181,20 @@ class Store:
     
     def update_file(self, dataframe: pd.DataFrame, filename: str):
         # TODO: check if time ranges of existing and new dataframes intersect, and generate warning 
-        # TODO: check if samplerate is different, and generate warning
+        # TODO: check if samplerate is different, and generate warning or error
 
         p = Path(self.path).joinpath(filename)
         file_content = pd.read_parquet(p)
-        updated_frame = pd.concat([file_content, dataframe])
-        is_duplicated = updated_frame.index.duplicated()
-        n_duplicated = is_duplicated.sum() # default keep='First', so old values are preserved
+        #updated_frame = pd.concat([file_content, dataframe])
+        #is_duplicated = updated_frame.index.duplicated()
+        #n_duplicated = is_duplicated.sum() # default keep='First', so old values are preserved
         #TODO: this is wrong warning
         #if you have a file of 10 tags, and you first update 5 tags, and in the second run you update another 5 tags,
         # then you;ll get a warning on the a lot of duplicated records on the second run
-        if n_duplicated:
-            logger.warning(f'While updating file {filename}, {n_duplicated} duplicated records were found.')
-        updated_frame = updated_frame.loc[~is_duplicated]
+        #if n_duplicated:
+        #    logger.warning(f'While updating file {filename}, {n_duplicated} duplicated records were found.')
+        #updated_frame = updated_frame.loc[~is_duplicated]
+        updated_frame = dataframe.combine_first(file_content)
         updated_frame.sort_index(inplace=True)
         updated_frame.to_parquet(p)
         logger.info(f'Tags {dataframe.columns.tolist()} written to existing file {filename}')
@@ -335,7 +289,7 @@ class Store:
             is_duplicated = d.index.duplicated()
             n_duplicated = is_duplicated.sum() # default keep='First', so old values are preserved
             if n_duplicated:
-                logger.warning(f'While readinf file {xl_path}, sheet {sheetname}, {n_duplicated} duplicated records were found.')
+                logger.warning(f'While reading file {xl_path}, sheet {sheetname}, {n_duplicated} duplicated records were found.')
             d = d.loc[~is_duplicated]
             # convert int columns to float
             cols_to_float = (d.dtypes==np.int64)
