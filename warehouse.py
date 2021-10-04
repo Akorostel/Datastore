@@ -1,19 +1,19 @@
 """ 
+Simple columnar storage for time-series implemented as a folder of parquet files.
+Designed for fast frequent reads and slow rare writes.
+
 Warehouse is a folder with parquet files. Each parquet file holds pandas dataframe with DateTimeIndex and several columns (tags)
 It is assumed that all dataframes in warehouse have identical sample rate.
 The library is designed for working with databases containing hundreds or several thousands of tags (columns) and hundreds of thousands rows.
 
 When dataframe is written to the warehouse, it is divided into portions of 10 tags per file (this default value can be changed). 
-Tag<->file mapping can be manually overridden when calling write(), or warehouse can be fully rebuilt later.
+Tag<->file mapping can be manually overridden when calling write(), or warehouse can be fully reorganized later.
 
 We cannot add or remove columns to file, so every write operation consists of:
 - read whole file from disk,
 - add data to file,
 - write whole dataframe to disk.
-This is why it's better to divide data to small portions
-
-Every folder has 'builtin' parquet file named vcb, which contains
-list of available tags, tag <-> file mapping, and (under question) other metadata (description, units, ...)
+This is why it's better to divide data into small portions
 
 Use case:
 import warehouse as wh
@@ -40,6 +40,7 @@ import warnings
 import uuid
 import openpyxl
 import logging
+import logging.handlers
 import sys
 
 # Setup logging
@@ -63,7 +64,7 @@ class Store:
         p = Path(path)
         if not p.is_dir():
             raise ValueError(f'Cannot connect to {p}')
-        self._vcb = self.build_vcb()
+        self._vcb = self._build_vcb()
         print('Succesfully connected to store.')
 
     @property
@@ -95,8 +96,9 @@ class Store:
             warnings.warn('tags_per_file set to 1000.')
         self._tags_per_file = value    
 
-    def build_vcb(self):
-        '''Rebuild vcb dataframe (tag <-> file mapping) '''
+    def _build_vcb(self):
+        """Rebuild vcb dataframe (tag <-> file mapping).
+        Function returns resulting dataframe, but doesn't change self.vcb property """
         files = [f for f in os.scandir(self._path) if f.is_file() and 
                                                       'metadata' not in f.name]
         tagname_list = []
@@ -145,55 +147,30 @@ class Store:
                                      index=pd.Series([], name='TagName', dtype='object'))
         return vcb
 
-    def rebuild_vcb():
-        self._vcb = build_vcb()
+    def rebuild_vcb(self):
+        """Rebuild vcb dataframe (tag <-> file mapping). """
+        self._vcb = self._build_vcb()
         return self._vcb
-    
-    def dataframe_is_valid(self, dataframe: pd.DataFrame):
-        '''Check if dataframe can be written to the store'''
-        # must have datetime index
-        if not isinstance(dataframe.index, pd.DatetimeIndex):
-            print('Dataframe index is not instance of DateTimeIndex')
-            return False
-
-        # index must be unique
-        number_of_duplicates = dataframe.index.duplicated().sum()
-        if number_of_duplicates > 0:
-            print(f'Dataframe index has {number_of_duplicates} duplicates.')
-            return False
-
-        return True
-        
-    def check_time_range(exist_begin, exist_end, new_begin, new_end):
-        #TODO:
-        if isinstance(exist_begin, str):
-            exist_begin = pd.Timestamp(exist_begin)
-        elif not isinstance(exist_begin, pd.Timestamp):
-            raise ValueError(f'exist_begin {exist_begin} is not a valid timestamp')
-            
-        new_before, new_after, new_partly_overlaps = False, False, False    
-        return
     
     #TODO: strange warning from pandas
     # A value is trying to be set on a copy of a slice from a DataFrame.
     # Try using .loc[row_indexer,col_indexer] = value instead
     # Where is it coming from?
     
-    def update_file(self, dataframe: pd.DataFrame, filename: str):
-        # TODO: check if time ranges of existing and new dataframes intersect, and generate warning 
-        # TODO: check if samplerate is different, and generate warning or error
-
+    def _update_file(self, dataframe: pd.DataFrame, filename: str):
         p = Path(self.path).joinpath(filename)
         file_content = pd.read_parquet(p)
-        #updated_frame = pd.concat([file_content, dataframe])
-        #is_duplicated = updated_frame.index.duplicated()
-        #n_duplicated = is_duplicated.sum() # default keep='First', so old values are preserved
-        #TODO: this is wrong warning
-        #if you have a file of 10 tags, and you first update 5 tags, and in the second run you update another 5 tags,
-        # then you;ll get a warning on the a lot of duplicated records on the second run
-        #if n_duplicated:
-        #    logger.warning(f'While updating file {filename}, {n_duplicated} duplicated records were found.')
-        #updated_frame = updated_frame.loc[~is_duplicated]
+
+        new_before, new_after, new_overlaps, inconsistent_freq = check_time_range(file_content.index, dataframe.index)
+        if new_overlaps:
+            msg = f'While updating file {filename} with tags {dataframe.columns.tolist()}, timestamp overlap was detected.'
+            logger.warning(msg)
+            print(msg)
+        if inconsistent_freq:
+            msg = f'While updating file {filename} with tags {dataframe.columns.tolist()}, inconsistent samplerate was detected.'
+            logger.error(msg)
+            raise ValueError(msg)
+
         updated_frame = dataframe.combine_first(file_content)
         updated_frame.sort_index(inplace=True)
         updated_frame.to_parquet(p)
@@ -204,9 +181,10 @@ class Store:
         Tag<->file mapping will be done automatically, but can also
         be provided in new_vcb dataframe (not supported yet)'''
         #TODO: support for new_vcb
-        #TODO: check if dataframe is valid
-        #TODO: check if dataframe's samplerate is compatible with samplerate of the store
         
+        if not dataframe_is_valid(dataframe):
+            raise ValueError('Please check if dataframe is valid.')
+
         # tags in dataframe:
         #   some already exist in the warehouse
         #       if file location is specified for existing tag and does not equal to its real location, then generate warning and exit
@@ -227,7 +205,7 @@ class Store:
         #       Call update_file(file, dataframe)
         for f in existing_files:
             tags = vcb_tags_to_write[vcb_tags_to_write['Filename']==f].index.tolist()
-            self.update_file(dataframe[tags], f)
+            self._update_file(dataframe[tags], f)
 
         # 3. For each non-existing file,
         #       Call dataframe.to_parquet()
@@ -238,6 +216,7 @@ class Store:
             dataframe[tags].to_parquet(f)
             logger.info(f'Tags {tags} written to newly created file {f}')
 
+        # Maybe its better to update only new/changed entries in vcb, rather than make full rebuild
         self.rebuild_vcb()
 
     def read(self, tags: List[str], begin: str=None, end: str=None) -> pd.DataFrame:
@@ -266,16 +245,9 @@ class Store:
         # different samplerates?
         return d[tags]
 
-    def _get_xl_info(xl_path: str) -> Dict:
-        wb = openpyxl.load_workbook(xl_path, read_only=True)
-        xl_info = dict()
-        for sh in wb.worksheets:
-            sh.title # get max_col, max_row takes too much time
-
-        return xl_info
-
     def update_from_excel_file(self, xl_path: str, resample_interval:str=None):
-        #list_of_dataframes = []
+        #TODO: add timing
+
         logger.info(f'Reading {xl_path}')
         #TODO: check if index column is called 'Date'
         odct = pd.read_excel(xl_path, 
@@ -297,9 +269,7 @@ class Store:
             if resample_interval:
                 d = d.resample(resample_interval).ffill()
             self.write(d)
-            #list_of_dataframes.append(d)
-        #d = pd.concat(list_of_dataframes, axis=1, join='outer', sort=True)
-        #self.write(d)
+
         return
 
     def reorganize(self, new_path: str, new_vcb: pd.DataFrame):
@@ -309,6 +279,74 @@ class Store:
     
 # TODO: Do we need it here? Maybe ROW_WISE storage is easyly implemented with single sqlite table?
 # ok, but we need 'update from excel' operation...
-class StoreType(Enum):
-    COLUMN_WISE = 1
-    ROW_WISE = 2
+#class StoreType(Enum):
+#    COLUMN_WISE = 1
+#    ROW_WISE = 2
+
+
+def dataframe_is_valid(dataframe: pd.DataFrame):
+    '''Check if dataframe can be written to the store'''
+
+    # must have datetime index
+    if not isinstance(dataframe.index, pd.DatetimeIndex):
+        print('Dataframe index is not instance of DateTimeIndex')
+        return False
+
+    # index must be unique
+    if dataframe.index.has_duplicates:
+        print(f'Dataframe index has duplicates.')
+        return False
+
+    # index must be monotonically increasing
+    if not dataframe.index.is_monotonic_increasing:
+        print(f'Dataframe index not sorted.')
+        return False
+
+    return True
+
+def get_freq(dti: pd.DatetimeIndex):
+    """Returns frequency of the index:
+    index.freq if it is specified,
+    index.inferred_freq if it can be computed,
+    If it cannot be computed, tries to infer based on last 5 elements."""
+
+    if dti.freq:
+        return dti.freq
+    elif dti.inferred_freq:
+        return dti.inferred_freq
+    else:
+        return dti[-5:].inferred_freq
+
+def check_time_range(existing_index, new_index):
+    exist_begin = existing_index[0]
+    exist_end = existing_index[-1]
+    new_begin = new_index[0]
+    new_end = new_index[-1]
+    
+    if exist_begin > exist_end:
+        raise ValueError('Begin of existing index is later then its end')
+    if new_begin > new_end:
+        raise ValueError('Begin of new index is later then its end')
+
+    new_before, new_after, new_overlaps = False, False, False   
+
+    if new_begin > exist_end:
+        new_after = True
+    elif new_end < exist_begin:
+        new_before = True
+    else:
+        new_overlaps = True
+
+    existing_freq = get_freq(existing_index)
+    new_freq = get_freq(new_index)
+    inconsistent_freq = existing_freq and new_freq and (existing_freq != new_freq)
+
+    return new_before, new_after, new_overlaps, inconsistent_freq
+
+def get_xl_info(xl_path: str) -> Dict:
+    wb = openpyxl.load_workbook(xl_path, read_only=True)
+    xl_info = dict()
+    for sh in wb.worksheets:
+        sh.title # get max_col, max_row takes too much time
+
+    return xl_info
