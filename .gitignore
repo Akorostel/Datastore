@@ -14,3 +14,9 @@ Thumbs.db
 
 # Notebooks
 *.ipynb
+
+# Log files
+*.log
+
+# backup copies
+*.bak
