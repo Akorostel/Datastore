@@ -9,45 +9,50 @@ import pandas as pd
 
 import warehouse as wh
 
-wh_folder = "..\\test_store\\"
-
+WH_FOLDER = "..\\test_store\\"
 
 class TestCreateWarehouse(unittest.TestCase):
+    """Test creating of new warehouse or connect to existing warehouse"""
     def test_create_no_folder(self):
         """Create new warehouse, folder doesnt exist"""
-        p = Path(wh_folder)
-        if p.is_dir():
+        path = Path(WH_FOLDER)
+        if path.is_dir():
             print("Deleting old folder...")
-            shutil.rmtree(wh_folder)
+            shutil.rmtree(WH_FOLDER)
         with self.assertRaises(
             ValueError, msg="Didn't raise error with non-existing folder"
         ):
-            store = wh.Store(wh_folder)
+            _ = wh.Store(WH_FOLDER)
 
     def test_create_empty_folder(self):
-        p = Path(wh_folder)
-        if p.is_dir():
+        """Create new warehouse, empty folder exists"""
+        path = Path(WH_FOLDER)
+        if path.is_dir():
             print("Deleting old folder...")
-            shutil.rmtree(wh_folder)
-        p.mkdir()
-        store = wh.Store(wh_folder)
+            shutil.rmtree(WH_FOLDER)
+        path.mkdir()
+        store = wh.Store(WH_FOLDER)
         self.assertTrue(store.vcb.empty, "Returned non-empty vcb just after creation")
 
     def test_create_folder_with_existing_parquet_files(self):
-        pass
+        """Create new warehouse, folder exists and filled with 
+        some parquet files"""
+
 
     def test_create_folder_with_existing_other_files(self):
-        pass
+        """Create new warehouse, folder exists and filled with 
+        some non-parquet files"""
+
 
 
 class TestReadWrite(unittest.TestCase):
     def setUp(self) -> None:
-        p = Path(wh_folder)
-        if p.is_dir():
+        path = Path(WH_FOLDER)
+        if path.is_dir():
             print("Deleting old folder...")
-            shutil.rmtree(wh_folder)
-        p.mkdir()
-        store = wh.Store(wh_folder)
+            shutil.rmtree(WH_FOLDER)
+        path.mkdir()
+        store = wh.Store(WH_FOLDER)
 
         nrows = 10
         dti = pd.date_range(
@@ -61,12 +66,12 @@ class TestReadWrite(unittest.TestCase):
         return super().setUp()
 
     def test_read_existing(self):
-        store = wh.Store(wh_folder)
-        df = store.read(list("ABCD"))
+        """Test read existing tag"""
+        store = wh.Store(WH_FOLDER)
+        dataframe = store.read(list("ABCD"))
         print(self.sample_df)
-        print(df)
-        self.assertTrue(self.sample_df.equals(df))
-        pass
+        print(dataframe)
+        self.assertTrue(self.sample_df.equals(dataframe))
 
     def test_write_read_random(self):
         pass
