@@ -58,11 +58,9 @@ from fastparquet import ParquetFile
 # Setup logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-fh = logging.handlers.TimedRotatingFileHandler(
-    'warehouse.log', when='D', backupCount=5)
+fh = logging.handlers.TimedRotatingFileHandler('warehouse.log', when='D', backupCount=5)
 fh.setLevel(logging.DEBUG)
-formatter = logging.Formatter(
-    '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 fh.setFormatter(formatter)
 if logger.hasHandlers():
     logger.handlers.clear()
@@ -386,6 +384,11 @@ def dataframe_is_valid(dataframe: pd.DataFrame):
     # must have datetime index
     if not isinstance(dataframe.index, pd.DatetimeIndex):
         print('Dataframe index is not instance of DateTimeIndex')
+        return False
+
+    # index must be named 'Timestamp'
+    if dataframe.index.name != 'Timestamp':
+        print('Dataframe index must be named "Timestamp".')
         return False
 
     # index must be unique

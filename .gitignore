@@ -17,6 +17,7 @@ Thumbs.db
 
 # Log files
 *.log
+*.log.*
 
 # backup copies
 *.bak
